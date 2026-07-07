@@ -28,15 +28,18 @@ p2_table:
 stack_bottom:
     resb 16384      ; 16 KB stack
 stack_top:
-
+global multiboot_ptr
+multiboot_ptr:
+    resd 1	; 4 bytes to store the 32-bit Multiboot2 pointer
 section .text
 bits 32
 global start
 extern long_mode_start
 
 start:
+    cli
     mov esp, stack_top
-
+    mov [multiboot_ptr], ebx	; save BEFORE any call clobbers ebx
     call check_multiboot
     call check_cpuid
     call check_long_mode

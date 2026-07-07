@@ -1,17 +1,22 @@
-/* Kernel.c - NovaOS Kernel entry point
+/* kernel.c — NovaOS kernel entry point
  * First C code that runs after long mode is set up.
- * Prints a boot banner direcly to VGA text memory.
+ * Prints a boot banner directly to VGA text memory.
  */
 #include <stdint.h>
 #include <stddef.h>
 #include "idt.h"
 #include "irq.h"
+#include "pmm.h"
+#include "heap.h"
+#include "slab.h"
+#include "multiboot2.h"
+#include "scheduler.h"
 
 /* VGA text mode buffer lives at physical address 0xB8000.
  * Each character cell is 2 bytes: [ASCII char][color attribute]
  */
 static uint16_t* const VGA_BUFFER = (uint16_t*) 0xB8000;
-static const int VGA_WIDTH = 80;
+static const int VGA_WIDTH  = 80;
 static const int VGA_HEIGHT = 25;
 static int cursor_row = 0;
 static int cursor_col = 0;
@@ -24,18 +29,14 @@ enum vga_color {
     VGA_COLOR_WHITE = 15,
 };
 
-static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg)
-{
+static inline uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
     return fg | bg << 4;
 }
-
-static inline uint16_t vga_entry(unsigned char c, uint8_t color)
-{
+static inline uint16_t vga_entry(unsigned char c, uint8_t color) {
     return (uint16_t) c | (uint16_t) color << 8;
 }
 
-void vga_clear(void)
-{
+void vga_clear(void) {
     uint8_t color = vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     for (int y = 0; y < VGA_HEIGHT; y++) {
         for (int x = 0; x < VGA_WIDTH; x++) {
@@ -83,7 +84,7 @@ void vga_print(const char* str, enum vga_color fg) {
     }
 }
 
-/* Minimal hex printer - no libc available in a freestanding kernel. */
+/* Minimal hex printer — no libc available in a freestanding kernel. */
 static void vga_print_hex(uint64_t value, enum vga_color fg) {
     char buf[19]; /* "0x" + 16 hex digits + null */
     const char* hex_chars = "0123456789ABCDEF";
@@ -100,20 +101,20 @@ static void vga_print_hex(uint64_t value, enum vga_color fg) {
 /* Exception names for vectors 0-19, per Intel SDM Vol 3, ch 6 */
 static const char* exception_name(uint64_t vector) {
     static const char* names[20] = {
-        "Divide Error", "Debug", "NMI", "BreakPoint", "Overflow",
+        "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
         "Bound Range Exceeded", "Invalid Opcode", "Device Not Available",
         "Double Fault", "Reserved", "Invalid TSS", "Segment Not Present",
         "Stack-Segment Fault", "General Protection Fault", "Page Fault",
         "Reserved", "x87 FP Exception", "Alignment Check",
+        "Machine Check", "SIMD FP Exception"
     };
     if (vector < 20) return names[vector];
     return "Unknown Exception";
 }
 
-/* Called  from isr_common_stub (isr.asm) for every exception.
- * These are all fatal for now - we have no recovery path yet -
- * so we print what happened and halt instead of triple-faulting.
-*/
+/* Called from isr_common_stub (isr.asm) for every exception.
+ * These are all fatal for now — we have no recovery path yet —
+ * so we print what happened and halt instead of triple-faulting. */
 void isr_handler(registers_t* regs) {
     vga_print("\n*** KERNEL PANIC: ", VGA_COLOR_RED);
     vga_print(exception_name(regs->vector), VGA_COLOR_RED);
@@ -140,32 +141,60 @@ void isr_handler(registers_t* regs) {
     }
 }
 
-/* ── Kernel entry point ──────────────────────────────────────── */
-void kernel_main(void) {
-    	vga_clear();
-    	vga_print("NovaOS v0.1\n", VGA_COLOR_GREEN);
-    	vga_print("ML-first operating system booting...\n", VGA_COLOR_WHITE);
-    	vga_print("\n", VGA_COLOR_WHITE);
-    	vga_print("[OK] Long mode initialized\n", VGA_COLOR_LIGHT_GREY);
-    	vga_print("[OK] Paging enabled\n", VGA_COLOR_LIGHT_GREY);
-    	vga_print("[OK] VGA text driver loaded\n", VGA_COLOR_LIGHT_GREY);
-    	idt_init();
-    	vga_print("[OK] IDT loaded (exceptions 0-19)\n", VGA_COLOR_LIGHT_GREY);
-	irq_init();
-	vga_print("[OK] PIC remapped, PIT + Keyboard IRQs installed\n", VGA_COLOR_LIGHT_GREY);
-	__asm__ volatile ("sti"); /* enable interrupts - IRQs were prepared masked until now */
-	vga_print("[OK] Interrupts enabled\n", VGA_COLOR_LIGHT_GREY);
-    	vga_print("\n", VGA_COLOR_WHITE);
-    	vga_print("Kernel running. Type something:\n", VGA_COLOR_WHITE);
+static void task_a(void) {
+	vga_print("TASK_A_STARTED\n", 4);
+	while (1) {
+		vga_print("A", 2);
+		for(volatile int i = 0; i < 1000000; i++);
+	}
+}
 
-    /* Sanity check: deliberately trigger #DE (divide by zero) to prove
-     * the IDT actually catches it instead of triple-faulting.
-     * Remvoe this once you-ve confirmed  it works. */
-    /*
-    volatile int a = 1, b = 0;
-    volatile int c = a / b;
-    (void) c;
-    */
+static void task_b(void) {
+	while (1) {
+		vga_print("B", 15);
+		for (volatile int i = 0; i < 1000000; i++);
+	}
+}
+
+/* ── Kernel entry point ──────────────────────────────────────── */
+void kernel_main(mb2_info_t* mb2_info) {
+    vga_clear();
+    vga_print("NovaOS v0.1\n", VGA_COLOR_GREEN);
+    vga_print("ML-first operating system booting...\n", VGA_COLOR_WHITE);
+    vga_print("\n", VGA_COLOR_WHITE);
+    vga_print("[OK] Long mode initialized\n", VGA_COLOR_LIGHT_GREY);
+    vga_print("[OK] Paging enabled\n", VGA_COLOR_LIGHT_GREY);
+    vga_print("[OK] VGA text driver loaded\n", VGA_COLOR_LIGHT_GREY);
+
+    pmm_init(mb2_info);
+    pmm_print_stats();
+    vga_print("[OK] Physical memory manager ready\n", VGA_COLOR_LIGHT_GREY);
+
+    heap_init();
+    heap_print_stats();
+    vga_print("[OK] Heap allocator ready\n", VGA_COLOR_LIGHT_GREY);
+
+    slab_init();
+    slab_print_stats();
+    vga_print("[OK] Tensor-aware slab allocator ready\n", VGA_COLOR_LIGHT_GREY);
+
+    idt_init();
+    vga_print("[OK] IDT loaded (exceptions 0-19)\n", VGA_COLOR_LIGHT_GREY);
+
+    irq_init();
+    vga_print("[OK] PIC remapped, PIT + keyboard IRQs installed\n", VGA_COLOR_LIGHT_GREY);
+
+    scheduler_init();
+    process_create(task_a, "task_a");
+    process_create(task_b, "task_b");
+    scheduler_print_stats();
+    vga_print("[OK] Scheduler ready\n", VGA_COLOR_LIGHT_GREY);
+
+    __asm__ volatile ("sti");
+    vga_print("[OK] Interrupts enabled\n", VGA_COLOR_LIGHT_GREY);
+
+    vga_print("\n", VGA_COLOR_WHITE);
+    vga_print("Kernel running. Type something:\n", VGA_COLOR_WHITE);
 
     for (;;) {
         __asm__ volatile ("hlt");

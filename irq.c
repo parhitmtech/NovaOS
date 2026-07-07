@@ -3,6 +3,7 @@
 #include "pic.h"
 #include "pit.h"
 #include "keyboard.h"
+#include "scheduler.h"
 
 /* IRQ gate stubs defined in irq.asm, one per hardware interrupt line */
 extern void irq0(void);  extern void irq1(void);  extern void irq2(void);
@@ -50,7 +51,9 @@ void irq_dispatch(registers_t* regs) {
 	switch (irq) {
 		case 0: /* PIT timer */
 			pit_ticks++;
+		        scheduler_tick();
 			pic_send_eoi(0);
+			scheduler_do_switch();
 			break;
 		case 1: /* Keyboard */
 			keyboard_handle_interrupt(); /* this also sends its own EOI */
